@@ -9,7 +9,7 @@ Self-hosted collaborative workspace for pentesters and red team operators. Captu
 
 ```bash
 # Install
-pipx install .
+pipx install git+https://github.com/IceCubeSandwich/chronix
 
 # Initialize (creates account and session secret)
 chronix init
