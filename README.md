@@ -127,49 +127,6 @@ Set via `~/.config/chronix/chronix.env` or `.env`:
 | `CHRONIX_BEHIND_PROXY` | `false` | Enable when behind TLS proxy |
 | `CHRONIX_RATE_LIMIT_LOGIN` | `5` | Login attempts before rate limit |
 
-## Security
-
-- Argon2id password hashing
-- Server-side sessions with HttpOnly/Secure/SameSite cookies
-- CSRF token protection
-- Login rate limiting (5 attempts per 5 minutes)
-- Image upload validation (MIME type + magic bytes)
-- Filename sanitization to prevent path traversal
-
-Deploy in trusted networks or behind VPN. For remote access, use a reverse proxy with TLS termination.
-
-## API Endpoints
-
-### Note Attachments
-
-```
-POST   /api/engagements/{eid}/note-pages/{pid}/attachments
-       Upload image (multipart/form-data)
-       
-GET    /api/engagements/{eid}/note-pages/{pid}/attachments
-       List attachments for note
-       
-DELETE /api/engagements/{eid}/note-pages/{pid}/attachments/{aid}
-       Delete attachment
-       
-GET    /api/attachments/{filename}
-       Serve attachment file
-```
-
-### Note Export
-
-```
-GET    /api/engagements/{eid}/note-pages/{pid}/export
-       Export single note as markdown
-       Query params: include_frontmatter (bool, default true)
-       
-GET    /api/engagements/{eid}/notes/export
-       Export all notes as zip
-       Query params: include_frontmatter (bool), include_attachments (bool)
-```
-
----
-
 ## Author
 
 **Tyrrell Brewster** — [GitHub](https://github.com/icecubesandwich) | [Website](https://0xtb.sh)
@@ -188,10 +145,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on submitting changes.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting.
 
-## Branding
-
-The Chronix name and logo are subject to [BRANDING.md](BRANDING.md). Forks must use a different name.
-
 ---
 
-**Built for operators.**
