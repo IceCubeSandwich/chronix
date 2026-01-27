@@ -5,6 +5,8 @@
 
 Self-hosted collaborative workspace for pentesters and red team operators. Captures notes, commands, outputs, and operational context during security engagements.
 
+![Image of Chronix](media/image-1.png)
+
 ## Quick Start
 
 ```bash
