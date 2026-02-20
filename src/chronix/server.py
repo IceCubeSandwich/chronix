@@ -1,1271 +1,615 @@
+#!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Tyrrell Brewster
 
-"""Chronix API Server"""
+"""Chronix CLI"""
 
-import csv
-import io
+import argparse
 import os
-import re
-import zipfile
-from datetime import datetime, timedelta
-from typing import Optional, List
-from contextlib import asynccontextmanager
+import sys
+import socket
+import webbrowser
+import secrets
+import string
 from pathlib import Path
-import uuid
-import mimetypes
-
-from fastapi import (
-    FastAPI, HTTPException, Depends, Query, WebSocket, 
-    WebSocketDisconnect, UploadFile, File, Request, Response, status
-)
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func, or_, distinct
-from sqlalchemy.orm import Session, joinedload
-
-from .models import (
-    init_db,
-    User, Operator, Engagement, TimelineEntry, NotePage, OperatorPresence, NoteAttachment,
-    UserRole as DBUserRole,
-    SystemModification as DBSystemModification,
-    ActionType as DBActionType,
-    EngagementStatus as DBEngagementStatus,
-    user_engagement_access,
-    CSV_COLUMNS, format_datetime_for_export
-)
-from .schemas import (
-    OperatorCreate, OperatorResponse, OperatorPresenceResponse,
-    EngagementUpdate, EngagementResponse,
-    TimelineEntryCreate, TimelineEntryUpdate, TimelineEntryResponse, TimelineListResponse,
-    NotePageCreate, NotePageUpdate, NotePageResponse, NotePageListResponse, NotePageReorderRequest,
-    NoteAttachmentResponse, NoteAttachmentListResponse,
-    CSVImportResult, SystemModification, ActionType, EngagementStatus
-)
-from .security import (
-    SecurityConfig, init_security,
-    UserRole, Permission, ROLE_PERMISSIONS,
-    hash_password, verify_password, password_needs_rehash,
-    SessionData, session_store, generate_csrf_token,
-    check_login_rate_limit, check_write_rate_limit,
-    sanitize_markdown, sanitize_plain_text,
-    get_current_session,
-    require_permission,
-    set_session_cookie, clear_session_cookie,
-    get_security_headers, get_cors_origins, get_client_ip,
-    UserCreate, UserUpdate, PasswordChange, LoginRequest, LoginResponse, UserResponse,
-    login_rate_limiter, write_rate_limiter,
-)
-
-DATABASE_PATH = os.environ.get("CHRONIX_DB_PATH", "chronix.db")
-ATTACHMENTS_PATH = os.environ.get("CHRONIX_ATTACHMENTS_PATH", "attachments")
-MAX_ATTACHMENT_SIZE = int(os.environ.get("CHRONIX_MAX_ATTACHMENT_SIZE", str(10 * 1024 * 1024)))  # 10MB default
-ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
-
-engine = None
-SessionLocal = None
+from datetime import datetime
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global engine, SessionLocal
+def get_version():
+    return "1.0.0"
+
+
+# =============================================================================
+# Configuration Management
+# =============================================================================
+
+CONFIG_DIR = Path.home() / ".config" / "chronix"
+CONFIG_FILE = CONFIG_DIR / "chronix.env"
+
+
+def load_config():
+    """Load configuration from ~/.config/chronix/chronix.env if it exists"""
+    if not CONFIG_FILE.exists():
+        return False
     
     try:
-        init_security()
-    except ValueError as e:
-        print(f"[FATAL] {e}")
-        raise
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith('#'):
+                    continue
+                # Parse KEY=value
+                if '=' in line:
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip()
+                    # Don't override existing environment variables
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+        return True
+    except Exception as e:
+        print(f"[Warning] Failed to load config from {CONFIG_FILE}: {e}")
+        return False
+
+
+def config_has_secret() -> bool:
+    """Check if config file exists and contains a session secret"""
+    if not CONFIG_FILE.exists():
+        return False
     
-    # Create attachments directory
-    attachments_dir = Path(ATTACHMENTS_PATH)
-    attachments_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[Storage] Attachments directory: {attachments_dir.absolute()}")
-    
-    engine = init_db(DATABASE_PATH)
-    from sqlalchemy.orm import sessionmaker
-    SessionLocal = sessionmaker(bind=engine)
-    
-    db = SessionLocal()
     try:
-        # Create default admin user if none exists
-        if db.query(User).count() == 0:
-            default_password = os.environ.get("CHRONIX_ADMIN_PASSWORD", "")
-            if not default_password:
-                import secrets
-                default_password = secrets.token_urlsafe(16)
-                print(f"\n{'='*60}")
-                print(f"[SETUP] Default admin: admin / {default_password}")
-                print(f"        Change this password immediately!")
-                print(f"{'='*60}\n")
+        with open(CONFIG_FILE) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('CHRONIX_SESSION_SECRET=') and len(line) > 25:
+                    # Has a non-empty secret
+                    return True
+    except Exception:
+        pass
+    
+    return False
+
+
+# =============================================================================
+# Secure Random Generation
+# =============================================================================
+
+def generate_secure_password(length: int = 24) -> str:
+    """
+    Generate a cryptographically secure random password.
+    
+    Uses secrets module (CSPRNG) for generation.
+    Character set: uppercase, lowercase, digits, and safe punctuation.
+    Ensures at least one of each character type for complexity requirements.
+    """
+    # Character sets
+    uppercase = string.ascii_uppercase
+    lowercase = string.ascii_lowercase
+    digits = string.digits
+    # Safe punctuation (avoiding shell-problematic characters)
+    punctuation = "!@#$%^&*()-_=+[]{}|;:,.<>?"
+    
+    all_chars = uppercase + lowercase + digits + punctuation
+    
+    # Ensure at least one of each type
+    password = [
+        secrets.choice(uppercase),
+        secrets.choice(lowercase),
+        secrets.choice(digits),
+        secrets.choice(punctuation),
+    ]
+    
+    # Fill the rest randomly
+    password.extend(secrets.choice(all_chars) for _ in range(length - 4))
+    
+    # Shuffle to avoid predictable positions
+    password_list = list(password)
+    secrets.SystemRandom().shuffle(password_list)
+    
+    return ''.join(password_list)
+
+
+def generate_session_secret(bytes_length: int = 32) -> str:
+    """
+    Generate a cryptographically secure session secret.
+    
+    Returns a 64-character hex string (32 bytes of entropy).
+    Suitable for HMAC signing of session cookies.
+    """
+    return secrets.token_hex(bytes_length)
+
+
+# =============================================================================
+# Init Command Implementation
+# =============================================================================
+
+def cmd_init(args):
+    """
+    Initialize Chronix.
+    
+    Creates:
+    1. Configuration file with session secret
+    2. Admin user in database
+    
+    Safe to run once. Refuses to overwrite existing config/admin.
+    """
+    # Colors for output
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
+    
+    print(f"""
+{CYAN}╔═══════════════════════════════════════════════════════════════╗
+║                    CHRONIX INITIALIZATION                     ║
+╚═══════════════════════════════════════════════════════════════╝{RESET}
+""")
+    
+    # Track what we need to do
+    create_config = False
+    create_admin = False
+    session_secret = None
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Check/Create Configuration
+    # -------------------------------------------------------------------------
+    print(f"{BOLD}[1/2] Checking configuration...{RESET}")
+    
+    if config_has_secret():
+        if args.force:
+            print(f"  {YELLOW}!{RESET} Config exists but --force specified, will regenerate secret")
+            create_config = True
+        else:
+            print(f"  {GREEN}✓{RESET} Session secret already configured: {CONFIG_FILE}")
+            print(f"    {CYAN}(use --force to regenerate){RESET}")
+    else:
+        create_config = True
+        if CONFIG_FILE.exists():
+            print(f"  {YELLOW}!{RESET} Config file exists but missing session secret")
+        else:
+            print(f"  {CYAN}→{RESET} Will create new configuration")
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Check/Create Admin User
+    # -------------------------------------------------------------------------
+    print(f"\n{BOLD}[2/2] Checking admin user...{RESET}")
+    
+    # We need to initialize the database to check for admin
+    db_path = args.db if args.db else os.environ.get("CHRONIX_DB_PATH", "./chronix.db")
+    db_path = str(Path(db_path).resolve())
+    os.environ["CHRONIX_DB_PATH"] = db_path
+    
+    # Import here to avoid circular imports and allow env to be set first
+    try:
+        from chronix.models import init_db, User, UserRole as DBUserRole
+        from chronix.security import hash_password
+        from sqlalchemy.orm import sessionmaker
+    except ImportError as e:
+        print(f"  {RED}✗{RESET} Failed to import Chronix modules: {e}")
+        print(f"    Make sure Chronix is properly installed.")
+        return 1
+    
+    # Initialize database (creates tables if needed)
+    engine = init_db(db_path)
+    Session = sessionmaker(bind=engine)
+    db = Session()
+    
+    try:
+        # Check for existing admin
+        existing_admin = db.query(User).filter(
+            User.role == DBUserRole.ADMIN,
+            User.is_active == True
+        ).first()
+        
+        if existing_admin:
+            if args.force:
+                print(f"  {YELLOW}!{RESET} Admin exists but --force specified")
+                print(f"  {RED}✗{RESET} Refusing to overwrite existing admin user for safety")
+                print(f"    Existing admin: {existing_admin.username}")
+                print(f"    {CYAN}To reset: manually delete the user from the database{RESET}")
+                # Don't create admin, but continue with config if needed
+            else:
+                print(f"  {GREEN}✓{RESET} Admin user already exists: {existing_admin.username}")
+        else:
+            create_admin = True
+            print(f"  {CYAN}→{RESET} Will create admin user")
+        
+        # -------------------------------------------------------------------------
+        # Execute Changes
+        # -------------------------------------------------------------------------
+        
+        admin_password = None
+        
+        if not create_config and not create_admin:
+            print(f"\n{GREEN}Chronix is already initialized. No changes needed.{RESET}")
+            return 0
+        
+        print(f"\n{BOLD}Applying changes...{RESET}\n")
+        
+        # Create/update config file
+        if create_config:
+            session_secret = generate_session_secret(32)
             
-            admin = User(
-                username="admin",
-                password_hash=hash_password(default_password),
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            
+            # Read existing config if present (to preserve other settings)
+            existing_lines = []
+            if CONFIG_FILE.exists():
+                with open(CONFIG_FILE) as f:
+                    existing_lines = [
+                        line for line in f.readlines()
+                        if not line.strip().startswith('CHRONIX_SESSION_SECRET=')
+                    ]
+            
+            with open(CONFIG_FILE, 'w') as f:
+                if existing_lines:
+                    f.writelines(existing_lines)
+                    if not existing_lines[-1].endswith('\n'):
+                        f.write('\n')
+                else:
+                    f.write(f"# Chronix Configuration\n")
+                    f.write(f"# Generated by 'chronix init' on {datetime.now().isoformat()}\n")
+                    f.write(f"#\n")
+                    f.write(f"# This file is loaded automatically by the chronix command.\n")
+                    f.write(f"# Keep this file secure - it contains your session signing secret.\n\n")
+                
+                f.write(f"CHRONIX_SESSION_SECRET={session_secret}\n")
+            
+            # Secure the config file (owner read/write only)
+            CONFIG_FILE.chmod(0o600)
+            
+            print(f"  {GREEN}✓{RESET} Session secret generated and saved")
+            print(f"    Location: {CONFIG_FILE}")
+            print(f"    Permissions: 600 (owner read/write only)")
+        
+        # Create admin user
+        if create_admin:
+            admin_password = generate_secure_password(24)
+            admin_username = args.username if args.username else "admin"
+            
+            admin_user = User(
+                username=admin_username,
+                password_hash=hash_password(admin_password),
                 display_name="Administrator",
                 role=DBUserRole.ADMIN,
             )
-            db.add(admin)
+            db.add(admin_user)
             db.commit()
+            
+            print(f"  {GREEN}✓{RESET} Admin user created")
+            print(f"    Username: {admin_username}")
+            print(f"    Role: Admin")
         
-        # Auto-create default workspace if none exists
-        if db.query(Engagement).count() == 0:
-            workspace = Engagement(
-                name="Workspace",
-                description="Operational workspace",
-                status=DBEngagementStatus.ACTIVE,
-            )
-            db.add(workspace)
-            db.commit()
-            print("[SETUP] Created default workspace")
+        # -------------------------------------------------------------------------
+        # Output Credentials (ONE TIME ONLY)
+        # -------------------------------------------------------------------------
+        
+        if admin_password:
+            print(f"""
+{YELLOW}{'═' * 66}
+ ⚠️  SAVE THESE CREDENTIALS - SHOWN ONCE ONLY
+{'═' * 66}{RESET}
+
+  {BOLD}Username:{RESET}  {admin_username}
+  {BOLD}Password:{RESET}  {admin_password}
+
+{YELLOW}{'═' * 66}{RESET}
+""")
+        
+        # -------------------------------------------------------------------------
+        # Final Instructions
+        # -------------------------------------------------------------------------
+        
+        print(f"""{GREEN}
+Initialization complete.{RESET}
+
+Run: {CYAN}chronix{RESET}
+""")
+        
+        return 0
+        
+    except Exception as e:
+        print(f"\n{RED}✗ Error during initialization:{RESET} {e}")
+        db.rollback()
+        return 1
     finally:
         db.close()
-    
-    import asyncio
-    async def cleanup():
-        while True:
-            await asyncio.sleep(300)
-            session_store.cleanup_expired()
-            login_rate_limiter.cleanup()
-            write_rate_limiter.cleanup()
-    
-    task = asyncio.create_task(cleanup())
-    yield
-    task.cancel()
-    engine.dispose()
 
 
-def get_db():
-    db = SessionLocal()
+# =============================================================================
+# Server Command (default)
+# =============================================================================
+
+def get_local_ips():
+    """Get all local IP addresses for network interfaces"""
+    ips = []
     try:
-        yield db
-    finally:
-        db.close()
-
-
-app = FastAPI(
-    title="Chronix",
-    description="Pentesting Workspace",
-    version="1.0.0",
-    lifespan=lifespan,
-    docs_url="/api/docs" if os.environ.get("CHRONIX_DEBUG", "").lower() == "true" else None,
-    redoc_url=None,
-)
-
-origins = get_cors_origins()
-if origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization", "X-CSRF-Token"],
-    )
-
-
-@app.middleware("http")
-async def security_headers(request: Request, call_next):
-    response = await call_next(request)
-    for k, v in get_security_headers().items():
-        response.headers[k] = v
-    return response
-
-
-FRONTEND_DIR = Path(__file__).parent / "frontend_dist"
-
-
-class ConnectionManager:
-    def __init__(self):
-        self.connections: dict[str, list[tuple[WebSocket, str, str]]] = {}
-    
-    async def connect(self, ws: WebSocket, eng_id: str, user_id: str, sess_id: str):
-        # NOTE: WebSocket is already accepted in ws_endpoint before calling this method
-        # Do NOT call ws.accept() here - it would cause ASGI protocol violation
-        self.connections.setdefault(eng_id, []).append((ws, user_id, sess_id))
-    
-    def disconnect(self, ws: WebSocket, eng_id: str):
-        if eng_id in self.connections:
-            self.connections[eng_id] = [(w, u, s) for w, u, s in self.connections[eng_id] if w != ws]
-    
-    async def broadcast(self, eng_id: str, msg: dict):
-        if eng_id not in self.connections:
-            return
-        dead = []
-        for ws, uid, sid in self.connections[eng_id]:
-            try:
-                sess = session_store.get(sid)
-                if sess and sess.has_engagement_access(eng_id):
-                    await ws.send_json(msg)
-                else:
-                    dead.append(ws)
-            except:
-                dead.append(ws)
-        for ws in dead:
-            self.disconnect(ws, eng_id)
-
-
-manager = ConnectionManager()
-
-
-def get_user_engagement_ids(db: Session, user_id: str) -> List[str]:
-    return [r[0] for r in db.query(user_engagement_access.c.engagement_id).filter(
-        user_engagement_access.c.user_id == user_id
-    ).all()]
-
-
-def verify_engagement_access(db: Session, session: SessionData, eng_id: str) -> Engagement:
-    eng = db.query(Engagement).filter(Engagement.id == eng_id).first()
-    if not eng:
-        raise HTTPException(404, "Engagement not found")
-    if not session.has_engagement_access(eng_id):
-        raise HTTPException(403, "Access denied")
-    return eng
-
-
-def entry_to_response(e: TimelineEntry) -> TimelineEntryResponse:
-    name = e.user.display_name if e.user else (e.operator.display_name if e.operator else "Unknown")
-    return TimelineEntryResponse(
-        id=e.id, engagement_id=e.engagement_id, operator_id=e.user_id or e.operator_id or "",
-        operator_name=name, start_time=e.start_time, end_time=e.end_time,
-        source_ip=e.source_ip, destination_ip=e.destination_ip, destination_port=e.destination_port,
-        destination_system=e.destination_system, pivot_ip=e.pivot_ip, pivot_port=e.pivot_port,
-        url=e.url, tool_app=e.tool_app, command=e.command, description=e.description,
-        output=e.output, result=e.result,
-        system_modification=SystemModification(e.system_modification.value) if e.system_modification else SystemModification.UNKNOWN,
-        action_type=ActionType(e.action_type.value) if e.action_type else None,
-        comments=e.comments, created_at=e.created_at, updated_at=e.updated_at, is_deleted=e.is_deleted
-    )
-
-
-def notepage_to_response(p: NotePage, db: Session) -> NotePageResponse:
-    editor = db.query(User).filter(User.id == p.edited_by).first() if p.edited_by else None
-    if not editor:
-        editor = db.query(Operator).filter(Operator.id == p.edited_by).first() if p.edited_by else None
-    return NotePageResponse(
-        id=p.id, engagement_id=p.engagement_id, title=p.title, content=p.content,
-        order_index=p.order_index, version=p.version, created_at=p.created_at, updated_at=p.updated_at,
-        edited_by=p.edited_by, editor_name=editor.display_name if editor else None
-    )
-
-
-# === Auth ===
-
-@app.post("/api/auth/login", response_model=LoginResponse)
-async def login(request: Request, response: Response, creds: LoginRequest, db: Session = Depends(get_db)):
-    ip = get_client_ip(request)
-    if not check_login_rate_limit(ip):
-        raise HTTPException(429, "Too many attempts")
-    
-    user = db.query(User).filter(User.username == creds.username).first()
-    if not user or not user.is_active or not verify_password(creds.password, user.password_hash):
-        raise HTTPException(401, "Invalid credentials")
-    
-    if password_needs_rehash(user.password_hash):
-        user.password_hash = hash_password(creds.password)
-    user.last_login = datetime.utcnow()
-    db.commit()
-    
-    eng_ids = None if user.role == DBUserRole.ADMIN else get_user_engagement_ids(db, user.id)
-    sess_id = session_store.create(user.id, user.username, UserRole(user.role.value), ip, request.headers.get("User-Agent", ""), eng_ids)
-    set_session_cookie(response, sess_id)
-    
-    return LoginResponse(user_id=user.id, username=user.username, display_name=user.display_name,
-                         role=UserRole(user.role.value), csrf_token=generate_csrf_token(sess_id))
-
-
-@app.post("/api/auth/logout")
-async def logout(request: Request, response: Response):
-    sid = request.cookies.get(SecurityConfig.SESSION_COOKIE_NAME)
-    if sid:
-        session_store.delete(sid)
-    clear_session_cookie(response)
-    return {"message": "Logged out"}
-
-
-@app.get("/api/auth/me", response_model=LoginResponse)
-async def me(request: Request, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == session.user_id).first()
-    sid = request.cookies.get(SecurityConfig.SESSION_COOKIE_NAME)
-    return LoginResponse(user_id=session.user_id, username=session.username,
-                         display_name=user.display_name if user else session.username,
-                         role=session.role, csrf_token=generate_csrf_token(sid) if sid else "")
-
-
-@app.post("/api/auth/change-password")
-async def change_pwd(request: Request, response: Response, data: PasswordChange,
-                     session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == session.user_id).first()
-    if not user or not verify_password(data.current_password, user.password_hash):
-        raise HTTPException(401, "Wrong password")
-    user.password_hash = hash_password(data.new_password)
-    user.password_changed_at = datetime.utcnow()
-    db.commit()
-    session_store.delete_all_for_user(user.id)
-    clear_session_cookie(response)
-    return {"message": "Password changed"}
-
-
-# === Users (Single-User Model) ===
-# Single user account created via `chronix init`.
-# User management endpoints are blocked.
-
-@app.post("/api/users", response_model=UserResponse)
-async def create_user(data: UserCreate, session: SessionData = Depends(require_permission(Permission.USER_CREATE)), db: Session = Depends(get_db)):
-    """User creation is not available. Use `chronix init` to set up the admin account."""
-    raise HTTPException(
-        status_code=403, 
-        detail="Chronix uses a single user account. User management is not available."
-    )
-
-
-@app.get("/api/users", response_model=List[UserResponse])
-async def list_users(session: SessionData = Depends(require_permission(Permission.USER_LIST)), db: Session = Depends(get_db)):
-    """Returns the single user for compatibility."""
-    return [UserResponse(id=u.id, username=u.username, display_name=u.display_name,
-                         role=UserRole(u.role.value), is_active=u.is_active,
-                         created_at=u.created_at, last_login=u.last_login,
-                         engagement_ids=None)
-            for u in db.query(User).filter(User.is_active == True).all()]
-
-
-@app.patch("/api/users/{user_id}", response_model=UserResponse)
-async def update_user(user_id: str, data: UserUpdate, session: SessionData = Depends(require_permission(Permission.USER_UPDATE)), db: Session = Depends(get_db)):
-    """Only display name updates are allowed."""
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(404, "Not found")
-    # Only allow display name changes, not role or status changes
-    if data.role is not None or data.is_active is not None:
-        raise HTTPException(
-            status_code=403,
-            detail="Chronix uses a single user account. Role and status changes are not available."
-        )
-    if data.display_name is not None:
-        user.display_name = data.display_name
-    db.commit()
-    return UserResponse(id=user.id, username=user.username, display_name=user.display_name,
-                        role=UserRole(user.role.value), is_active=user.is_active,
-                        created_at=user.created_at, last_login=user.last_login,
-                        engagement_ids=None)
-
-
-@app.delete("/api/users/{user_id}")
-async def delete_user(user_id: str, session: SessionData = Depends(require_permission(Permission.USER_DELETE)), db: Session = Depends(get_db)):
-    """User deletion is not available."""
-    raise HTTPException(
-        status_code=403, 
-        detail="Chronix uses a single user account. User management is not available."
-    )
-
-
-# === Operators (Legacy - Disabled) ===
-# Legacy operator model kept for database compatibility.
-
-@app.post("/api/operators", response_model=OperatorResponse)
-def create_operator(op: OperatorCreate, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    """Operator management is not available. Actions are attributed to the logged-in user."""
-    raise HTTPException(
-        status_code=403,
-        detail="Chronix uses a single user account. Operator management is not available."
-    )
-
-
-@app.get("/api/operators", response_model=List[OperatorResponse])
-def list_operators(session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    """Returns empty list for compatibility."""
-    return []
-
-
-@app.get("/api/operators/{oid}", response_model=OperatorResponse)
-def get_operator(oid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    o = db.query(Operator).filter(Operator.id == oid).first()
-    if not o:
-        raise HTTPException(404, "Not found")
-    return o
-
-
-# === Workspace Data ===
-# Single implicit workspace. These endpoints use workspace ID from /api/workspace.
-
-@app.get("/api/engagements/{eid}", response_model=EngagementResponse)
-def get_engagement(eid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    e = verify_engagement_access(db, session, eid)
-    cnt = db.query(TimelineEntry).filter(TimelineEntry.engagement_id == eid, TimelineEntry.is_deleted == False).count()
-    return EngagementResponse(id=e.id, name=e.name, client_name=e.client_name, description=e.description,
-                              status=EngagementStatus(e.status.value), start_date=e.start_date, end_date=e.end_date,
-                              created_at=e.created_at, updated_at=e.updated_at, entry_count=cnt)
-
-
-# === Timeline ===
-
-@app.get("/api/engagements/{eid}/timeline")
-def get_timeline(eid: str, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200),
-                 operator_id: Optional[str] = None, action_type: Optional[ActionType] = None,
-                 tool_app: Optional[str] = None, search: Optional[str] = None, include_deleted: bool = False,
-                 session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    verify_engagement_access(db, session, eid)
-    q = db.query(TimelineEntry).filter(TimelineEntry.engagement_id == eid)
-    if not include_deleted:
-        q = q.filter(TimelineEntry.is_deleted == False)
-    if operator_id:
-        q = q.filter(or_(TimelineEntry.user_id == operator_id, TimelineEntry.operator_id == operator_id))
-    if action_type:
-        q = q.filter(TimelineEntry.action_type == DBActionType(action_type.value))
-    if tool_app:
-        q = q.filter(TimelineEntry.tool_app.ilike(f"%{tool_app}%"))
-    if search:
-        t = f"%{search}%"
-        q = q.filter(or_(TimelineEntry.description.ilike(t), TimelineEntry.command.ilike(t), TimelineEntry.output.ilike(t)))
-    total = q.count()
-    entries = q.options(joinedload(TimelineEntry.user), joinedload(TimelineEntry.operator)) \
-        .order_by(TimelineEntry.start_time.desc()).offset((page-1)*page_size).limit(page_size).all()
-    ops = db.query(distinct(TimelineEntry.user_id)).filter(TimelineEntry.engagement_id == eid, TimelineEntry.is_deleted == False).count()
-    tgts = db.query(distinct(TimelineEntry.destination_ip)).filter(TimelineEntry.engagement_id == eid, TimelineEntry.is_deleted == False, TimelineEntry.destination_ip.isnot(None)).count()
-    return TimelineListResponse(entries=[entry_to_response(e) for e in entries], total=total, page=page, page_size=page_size, unique_operators=ops, unique_targets=tgts)
-
-
-@app.post("/api/engagements/{eid}/timeline", response_model=TimelineEntryResponse)
-async def create_entry(eid: str, entry: TimelineEntryCreate, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.TIMELINE_CREATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    if not check_write_rate_limit(session.user_id):
-        raise HTTPException(429, "Rate limit")
-    e = TimelineEntry(engagement_id=eid, user_id=session.user_id, start_time=entry.start_time or datetime.utcnow(),
-                      end_time=entry.end_time, source_ip=entry.source_ip, destination_ip=entry.destination_ip,
-                      destination_port=entry.destination_port, destination_system=entry.destination_system,
-                      pivot_ip=entry.pivot_ip, pivot_port=entry.pivot_port, url=entry.url, tool_app=entry.tool_app,
-                      command=entry.command, description=entry.description, output=entry.output, result=entry.result,
-                      system_modification=DBSystemModification(entry.system_modification.value),
-                      action_type=DBActionType(entry.action_type.value) if entry.action_type else None, comments=entry.comments)
-    db.add(e)
-    db.commit()
-    r = entry_to_response(e)
-    await manager.broadcast(eid, {"type": "timeline_update", "action": "create", "entry": r.model_dump(mode='json')})
-    return r
-
-
-@app.get("/api/engagements/{eid}/timeline/{tid}", response_model=TimelineEntryResponse)
-def get_entry(eid: str, tid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    verify_engagement_access(db, session, eid)
-    e = db.query(TimelineEntry).options(joinedload(TimelineEntry.user), joinedload(TimelineEntry.operator)) \
-        .filter(TimelineEntry.id == tid, TimelineEntry.engagement_id == eid).first()
-    if not e:
-        raise HTTPException(404, "Not found")
-    return entry_to_response(e)
-
-
-@app.patch("/api/engagements/{eid}/timeline/{tid}", response_model=TimelineEntryResponse)
-async def update_entry(eid: str, tid: str, data: TimelineEntryUpdate, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.TIMELINE_UPDATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    e = db.query(TimelineEntry).filter(TimelineEntry.id == tid, TimelineEntry.engagement_id == eid).first()
-    if not e:
-        raise HTTPException(404, "Not found")
-    for k, v in data.model_dump(exclude_unset=True).items():
-        if k == "system_modification" and v:
-            setattr(e, k, DBSystemModification(v.value))
-        elif k == "action_type" and v:
-            setattr(e, k, DBActionType(v.value))
-        else:
-            setattr(e, k, v)
-    db.commit()
-    r = entry_to_response(e)
-    await manager.broadcast(eid, {"type": "timeline_update", "action": "update", "entry": r.model_dump(mode='json')})
-    return r
-
-
-@app.delete("/api/engagements/{eid}/timeline/{tid}")
-async def delete_entry(eid: str, tid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.TIMELINE_DELETE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    e = db.query(TimelineEntry).filter(TimelineEntry.id == tid, TimelineEntry.engagement_id == eid).first()
-    if not e:
-        raise HTTPException(404, "Not found")
-    e.is_deleted = True
-    db.commit()
-    await manager.broadcast(eid, {"type": "timeline_update", "action": "delete", "entry_id": tid})
-    return {"message": "Deleted"}
-
-
-# === Notes ===
-
-@app.get("/api/engagements/{eid}/note-pages", response_model=NotePageListResponse)
-def get_pages(eid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    verify_engagement_access(db, session, eid)
-    pages = db.query(NotePage).filter(NotePage.engagement_id == eid).order_by(NotePage.order_index).all()
-    return NotePageListResponse(pages=[notepage_to_response(p, db) for p in pages], total=len(pages))
-
-
-@app.post("/api/engagements/{eid}/note-pages", response_model=NotePageResponse)
-async def create_page(eid: str, page: NotePageCreate, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.NOTES_CREATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    mx = db.query(func.max(NotePage.order_index)).filter(NotePage.engagement_id == eid).scalar() or -1
-    p = NotePage(engagement_id=eid, title=sanitize_plain_text(page.title), content=sanitize_markdown(page.content),
-                 order_index=mx+1, edited_by=session.user_id)
-    db.add(p)
-    db.commit()
-    r = notepage_to_response(p, db)
-    await manager.broadcast(eid, {"type": "notepage_update", "action": "create", "page": r.model_dump(mode='json')})
-    return r
-
-
-@app.get("/api/engagements/{eid}/note-pages/{pid}", response_model=NotePageResponse)
-def get_page(eid: str, pid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    verify_engagement_access(db, session, eid)
-    p = db.query(NotePage).filter(NotePage.id == pid, NotePage.engagement_id == eid).first()
-    if not p:
-        raise HTTPException(404, "Not found")
-    return notepage_to_response(p, db)
-
-
-@app.patch("/api/engagements/{eid}/note-pages/{pid}", response_model=NotePageResponse)
-async def update_page(eid: str, pid: str, data: NotePageUpdate, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.NOTES_UPDATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    p = db.query(NotePage).filter(NotePage.id == pid, NotePage.engagement_id == eid).first()
-    if not p:
-        raise HTTPException(404, "Not found")
-    if data.title is not None:
-        p.title = sanitize_plain_text(data.title)
-    if data.content is not None:
-        p.content = sanitize_markdown(data.content)
-    if data.order_index is not None:
-        p.order_index = data.order_index
-    p.edited_by = session.user_id
-    p.version += 1
-    db.commit()
-    r = notepage_to_response(p, db)
-    await manager.broadcast(eid, {"type": "notepage_update", "action": "update", "page": r.model_dump(mode='json')})
-    return r
-
-
-@app.delete("/api/engagements/{eid}/note-pages/{pid}")
-async def delete_page(eid: str, pid: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.NOTES_DELETE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    p = db.query(NotePage).filter(NotePage.id == pid, NotePage.engagement_id == eid).first()
-    if not p:
-        raise HTTPException(404, "Not found")
-    db.delete(p)
-    db.commit()
-    await manager.broadcast(eid, {"type": "notepage_update", "action": "delete", "page_id": pid})
-    return {"message": "Deleted"}
-
-
-@app.post("/api/engagements/{eid}/note-pages/reorder")
-async def reorder_pages(eid: str, data: NotePageReorderRequest, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    """Reorder note pages by updating their order_index values."""
-    if Permission.NOTES_UPDATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    
-    for item in data.page_orders:
-        page_id = item.get("id")
-        order_index = item.get("order_index")
-        if page_id is not None and order_index is not None:
-            p = db.query(NotePage).filter(NotePage.id == page_id, NotePage.engagement_id == eid).first()
-            if p:
-                p.order_index = order_index
-    db.commit()
-    await manager.broadcast(eid, {"type": "notepage_update", "action": "reorder"})
-    return {"message": "Reordered"}
-
-
-# === Export ===
-
-def sanitize_csv_field(field: str) -> str:
-    """
-    Sanitize field for CSV export to prevent formula injection.
-    
-    Prepends single quote to fields starting with =, +, -, @, tab, or carriage return.
-    This prevents spreadsheet applications from interpreting the field as a formula.
-    
-    References:
-    - OWASP: https://owasp.org/www-community/attacks/CSV_Injection
-    - CWE-1236: Improper Neutralization of Formula Elements in a CSV File
-    """
-    if not field:
-        return field
-    if field[0] in ('=', '+', '-', '@', '\t', '\r'):
-        return "'" + field
-    return field
-
-
-@app.get("/api/engagements/{eid}/export")
-async def export(eid: str, include_deleted: bool = False, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    if Permission.EXPORT_DATA not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    q = db.query(TimelineEntry).filter(TimelineEntry.engagement_id == eid)
-    if not include_deleted:
-        q = q.filter(TimelineEntry.is_deleted == False)
-    entries = q.options(joinedload(TimelineEntry.user), joinedload(TimelineEntry.operator)).order_by(TimelineEntry.start_time).all()
-    out = io.StringIO()
-    w = csv.DictWriter(out, fieldnames=CSV_COLUMNS)
-    w.writeheader()
-    for e in entries:
-        w.writerow({
-            "start_time": format_datetime_for_export(e.start_time), "end_time": format_datetime_for_export(e.end_time),
-            "operator_name": sanitize_csv_field(e.user.display_name if e.user else (e.operator.display_name if e.operator else "Unknown")),
-            "source_ip": sanitize_csv_field(e.source_ip or ""), "destination_ip": sanitize_csv_field(e.destination_ip or ""),
-            "destination_port": sanitize_csv_field(e.destination_port or ""), "destination_system": sanitize_csv_field(e.destination_system or ""),
-            "pivot_ip": sanitize_csv_field(e.pivot_ip or ""), "pivot_port": sanitize_csv_field(e.pivot_port or ""), "url": sanitize_csv_field(e.url or ""),
-            "tool_app": sanitize_csv_field(e.tool_app or ""), "command": sanitize_csv_field(e.command or ""), "description": sanitize_csv_field(e.description or ""),
-            "output": sanitize_csv_field(e.output or ""), "result": sanitize_csv_field(e.result or ""),
-            "system_modification": sanitize_csv_field(e.system_modification.value if e.system_modification else ""), "comments": sanitize_csv_field(e.comments or ""),
-        })
-    eng = db.query(Engagement).filter(Engagement.id == eid).first()
-    fn = f"chronix_{eng.name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
-    return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{fn}"'})
-
-
-def parse_datetime_for_import(value: str) -> Optional[datetime]:
-    """Parse datetime from CSV import format (YYYYMMDD_HHMMSS)."""
-    if not value or not value.strip():
-        return None
-    value = value.strip()
-    # Try the export format first: YYYYMMDD_HHMMSS
-    try:
-        return datetime.strptime(value, "%Y%m%d_%H%M%S")
-    except ValueError:
+        # Get hostname
+        hostname = socket.gethostname()
+        # Get all IPs for this host
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in ips and not ip.startswith('127.'):
+                ips.append(ip)
+    except Exception:
         pass
-    # Try ISO format as fallback
+    
+    # Also try to get IP by connecting to external address (doesn't actually connect)
     try:
-        return datetime.fromisoformat(value.replace('Z', '+00:00'))
-    except ValueError:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        if ip not in ips:
+            ips.append(ip)
+        s.close()
+    except Exception:
         pass
-    return None
-
-
-@app.post("/api/engagements/{eid}/import", response_model=CSVImportResult)
-async def import_csv(eid: str, file: UploadFile = File(...), session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    """Import timeline entries from a CSV file."""
-    if Permission.TIMELINE_CREATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
     
-    # Read and decode file
+    return ips
+
+
+def print_initialization_required():
+    """Print clean initialization required message and exit instructions"""
+    ORANGE = "\033[38;5;208m"
+    CYAN = "\033[36m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+    
+    print(f"""
+{ORANGE}╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║     ██████╗██╗  ██╗██████╗  ██████╗ ███╗   ██╗██╗██╗  ██╗    ║
+║    ██╔════╝██║  ██║██╔══██╗██╔═══██╗████╗  ██║██║╚██╗██╔╝    ║
+║    ██║     ███████║██████╔╝██║   ██║██╔██╗ ██║██║ ╚███╔╝     ║
+║    ██║     ██╔══██║██╔══██╗██║   ██║██║╚██╗██║██║ ██╔██╗     ║
+║    ╚██████╗██║  ██║██║  ██║╚██████╔╝██║ ╚████║██║██╔╝ ██╗    ║
+║     ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝  ╚═╝    ║
+║                                                               ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝{RESET}
+
+{"="*70}
+{ORANGE}INITIALIZATION REQUIRED{RESET}
+{"="*70}
+
+Run:
+
+    {CYAN}chronix init{RESET}
+
+{"="*70}
+""")
+
+
+def cmd_serve(args):
+    """Run the Chronix server"""
+    # Load config file first
+    config_loaded = load_config()
+    
+    # Feature #3: If --local flag is set, override host to 127.0.0.1
+    host = args.host
+    if args.local:
+        host = "127.0.0.1"
+    
+    # Set environment variables for the server
+    os.environ["CHRONIX_DB_PATH"] = str(Path(args.db).resolve())
+    
+    # Handle --debug flag
+    if args.debug:
+        os.environ["CHRONIX_DEBUG"] = "true"
+    
+    # Check initialization state BEFORE starting ASGI (unless debug mode)
+    if not args.debug and not config_has_secret():
+        print_initialization_required()
+        sys.exit(1)
+    
+    # Print banner
+    print_banner(host, args.port, args.db, config_loaded)
+    
+    # Feature #3: Show network warning when binding to 0.0.0.0
+    if host == "0.0.0.0":
+        print_network_warning(args.port)
+    
+    # Open browser unless disabled
+    if not args.no_browser:
+        import threading
+        def open_browser():
+            import time
+            time.sleep(1.5)  # Wait for server to start
+            # Use localhost for browser even if binding to 0.0.0.0
+            browser_host = "127.0.0.1" if host == "0.0.0.0" else host
+            webbrowser.open(f"http://{browser_host}:{args.port}")
+        threading.Thread(target=open_browser, daemon=True).start()
+    
+    # Start the server
     try:
-        content = await file.read()
-        text = content.decode('utf-8')
-    except UnicodeDecodeError:
-        return CSVImportResult(success=False, imported_count=0, error_count=1, errors=["File must be UTF-8 encoded"])
-    
-    reader = csv.DictReader(io.StringIO(text))
-    imported_count = 0
-    error_count = 0
-    errors = []
-    
-    for row_num, row in enumerate(reader, start=2):  # Row 2 is first data row after header
-        try:
-            # Parse start_time (required for a valid entry)
-            start_time = parse_datetime_for_import(row.get("start_time", ""))
-            if not start_time:
-                start_time = datetime.utcnow()
-            
-            # Map system_modification string to enum
-            sys_mod_str = row.get("system_modification", "").strip()
-            sys_mod = DBSystemModification.UNKNOWN
-            for sm in DBSystemModification:
-                if sm.value.lower() == sys_mod_str.lower():
-                    sys_mod = sm
-                    break
-            
-            entry = TimelineEntry(
-                engagement_id=eid,
-                user_id=session.user_id,
-                start_time=start_time,
-                end_time=parse_datetime_for_import(row.get("end_time", "")),
-                source_ip=sanitize_plain_text(row.get("source_ip", ""))[:45] or None,
-                destination_ip=sanitize_plain_text(row.get("destination_ip", ""))[:45] or None,
-                destination_port=sanitize_plain_text(row.get("destination_port", ""))[:16] or None,
-                destination_system=sanitize_plain_text(row.get("destination_system", ""))[:256] or None,
-                pivot_ip=sanitize_plain_text(row.get("pivot_ip", ""))[:45] or None,
-                pivot_port=sanitize_plain_text(row.get("pivot_port", ""))[:32] or None,
-                url=sanitize_plain_text(row.get("url", "")) or None,
-                tool_app=sanitize_plain_text(row.get("tool_app", ""))[:128] or None,
-                command=sanitize_plain_text(row.get("command", "")) or None,
-                description=sanitize_plain_text(row.get("description", "")) or None,
-                output=sanitize_plain_text(row.get("output", "")) or None,
-                result=sanitize_plain_text(row.get("result", "")) or None,
-                system_modification=sys_mod,
-                comments=sanitize_plain_text(row.get("comments", "")) or None,
-            )
-            db.add(entry)
-            imported_count += 1
-        except Exception as e:
-            error_count += 1
-            errors.append(f"Row {row_num}: {str(e)}")
-            if len(errors) >= 10:
-                errors.append("... (additional errors truncated)")
-                break
-    
-    if imported_count > 0:
-        db.commit()
-        # Broadcast update for real-time sync
-        await manager.broadcast(eid, {"type": "timeline_update", "action": "import", "count": imported_count})
-    
-    return CSVImportResult(
-        success=error_count == 0,
-        imported_count=imported_count,
-        error_count=error_count,
-        errors=errors
-    )
-
-
-# === Note Attachments ===
-
-def slugify(text: str, max_length: int = 50) -> str:
-    """
-    Convert text to a safe filename slug.
-    - Lowercase
-    - Replace spaces and special chars with hyphens
-    - Remove consecutive hyphens
-    - Truncate to max_length
-    """
-    text = text.lower().strip()
-    # Replace spaces and common separators with hyphens
-    text = re.sub(r'[\s_]+', '-', text)
-    # Remove any non-alphanumeric characters (except hyphens)
-    text = re.sub(r'[^a-z0-9\-]', '', text)
-    # Remove consecutive hyphens
-    text = re.sub(r'-+', '-', text)
-    # Remove leading/trailing hyphens
-    text = text.strip('-')
-    # Truncate
-    if len(text) > max_length:
-        text = text[:max_length].rstrip('-')
-    return text or 'untitled'
-
-
-def sanitize_filename(filename: str) -> str:
-    """
-    Sanitize a filename to prevent path traversal and other attacks.
-    """
-    # Remove path components
-    filename = os.path.basename(filename)
-    # Remove null bytes and other dangerous characters
-    filename = re.sub(r'[\x00-\x1f\x7f<>:"/\\|?*]', '', filename)
-    # Limit length
-    name, ext = os.path.splitext(filename)
-    if len(name) > 100:
-        name = name[:100]
-    if len(ext) > 10:
-        ext = ext[:10]
-    return f"{name}{ext}" if name else f"file{ext}"
-
-
-def generate_stored_filename(note_page_id: str, original_filename: str) -> str:
-    """
-    Generate a unique stored filename.
-    Format: {note_id_prefix}_{timestamp}_{uuid}.{ext}
-    """
-    ext = os.path.splitext(original_filename)[1].lower() or '.png'
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    unique_id = str(uuid.uuid4())[:8]
-    return f"{note_page_id[:8]}_{timestamp}_{unique_id}{ext}"
-
-
-def attachment_to_response(att: NoteAttachment) -> NoteAttachmentResponse:
-    """Convert NoteAttachment model to response schema."""
-    return NoteAttachmentResponse(
-        id=att.id,
-        note_page_id=att.note_page_id,
-        engagement_id=att.engagement_id,
-        filename=att.filename,
-        stored_filename=att.stored_filename,
-        mime_type=att.mime_type,
-        file_size=att.file_size,
-        alt_text=att.alt_text or "",
-        created_at=att.created_at,
-        uploaded_by=att.uploaded_by,
-        url=f"/api/attachments/{att.stored_filename}"
-    )
-
-
-@app.post("/api/engagements/{eid}/note-pages/{pid}/attachments", response_model=NoteAttachmentResponse)
-async def upload_attachment(
-    eid: str, 
-    pid: str, 
-    file: UploadFile = File(...),
-    alt_text: str = "",
-    session: SessionData = Depends(get_current_session), 
-    db: Session = Depends(get_db)
-):
-    """
-    Upload an image attachment for a note page.
-    
-    Supports PNG, JPEG, GIF, WebP images up to 10MB (configurable).
-    Returns the attachment info including the URL to embed in markdown.
-    """
-    if Permission.NOTES_UPDATE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    
-    # Verify note page exists
-    page = db.query(NotePage).filter(NotePage.id == pid, NotePage.engagement_id == eid).first()
-    if not page:
-        raise HTTPException(404, "Note page not found")
-    
-    # Validate MIME type
-    content_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
-    if content_type not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            400, 
-            f"Invalid file type: {content_type}. Allowed: {', '.join(ALLOWED_MIME_TYPES)}"
-        )
-    
-    # Read file content
-    content = await file.read()
-    file_size = len(content)
-    
-    # Validate file size
-    if file_size > MAX_ATTACHMENT_SIZE:
-        raise HTTPException(
-            400, 
-            f"File too large: {file_size} bytes. Maximum: {MAX_ATTACHMENT_SIZE} bytes"
-        )
-    
-    # Validate file content (magic bytes check)
-    magic_bytes = {
-        b'\x89PNG': 'image/png',
-        b'\xff\xd8\xff': 'image/jpeg',
-        b'GIF87a': 'image/gif',
-        b'GIF89a': 'image/gif',
-        b'RIFF': 'image/webp',  # WebP starts with RIFF
-    }
-    detected_type = None
-    for magic, mime in magic_bytes.items():
-        if content.startswith(magic):
-            detected_type = mime
-            break
-    
-    # Special check for WebP (RIFF + WEBP)
-    if content[:4] == b'RIFF' and content[8:12] == b'WEBP':
-        detected_type = 'image/webp'
-    
-    if detected_type is None or detected_type != content_type:
-        raise HTTPException(400, "File content does not match declared type")
-    
-    # Generate safe filenames
-    original_filename = sanitize_filename(file.filename or "image.png")
-    stored_filename = generate_stored_filename(pid, original_filename)
-    
-    # Save file to disk
-    attachments_dir = Path(ATTACHMENTS_PATH)
-    file_path = attachments_dir / stored_filename
-    
-    try:
-        with open(file_path, 'wb') as f:
-            f.write(content)
-    except IOError as e:
-        raise HTTPException(500, f"Failed to save file: {e}")
-    
-    # Create database record
-    attachment = NoteAttachment(
-        note_page_id=pid,
-        engagement_id=eid,
-        filename=original_filename,
-        stored_filename=stored_filename,
-        mime_type=content_type,
-        file_size=file_size,
-        alt_text=sanitize_plain_text(alt_text) if alt_text else "",
-        uploaded_by=session.user_id
-    )
-    db.add(attachment)
-    db.commit()
-    
-    return attachment_to_response(attachment)
-
-
-@app.get("/api/engagements/{eid}/note-pages/{pid}/attachments", response_model=NoteAttachmentListResponse)
-def list_attachments(
-    eid: str, 
-    pid: str,
-    session: SessionData = Depends(get_current_session), 
-    db: Session = Depends(get_db)
-):
-    """List all attachments for a note page."""
-    verify_engagement_access(db, session, eid)
-    
-    attachments = db.query(NoteAttachment).filter(
-        NoteAttachment.note_page_id == pid,
-        NoteAttachment.engagement_id == eid
-    ).order_by(NoteAttachment.created_at).all()
-    
-    return NoteAttachmentListResponse(
-        attachments=[attachment_to_response(a) for a in attachments],
-        total=len(attachments)
-    )
-
-
-@app.delete("/api/engagements/{eid}/note-pages/{pid}/attachments/{aid}")
-async def delete_attachment(
-    eid: str, 
-    pid: str, 
-    aid: str,
-    session: SessionData = Depends(get_current_session), 
-    db: Session = Depends(get_db)
-):
-    """Delete an attachment."""
-    if Permission.NOTES_DELETE not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    
-    attachment = db.query(NoteAttachment).filter(
-        NoteAttachment.id == aid,
-        NoteAttachment.note_page_id == pid,
-        NoteAttachment.engagement_id == eid
-    ).first()
-    
-    if not attachment:
-        raise HTTPException(404, "Attachment not found")
-    
-    # Delete file from disk
-    file_path = Path(ATTACHMENTS_PATH) / attachment.stored_filename
-    if file_path.exists():
-        try:
-            file_path.unlink()
-        except IOError:
-            pass  # File already gone, continue with DB cleanup
-    
-    # Delete database record
-    db.delete(attachment)
-    db.commit()
-    
-    return {"message": "Deleted"}
-
-
-@app.get("/api/attachments/{filename}")
-async def serve_attachment(filename: str, session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    """
-    Serve an attachment file.
-    
-    Security: Verifies the user has access to the engagement the attachment belongs to.
-    """
-    # Sanitize filename to prevent path traversal
-    safe_filename = os.path.basename(filename)
-    if safe_filename != filename:
-        raise HTTPException(400, "Invalid filename")
-    
-    # Find attachment in DB
-    attachment = db.query(NoteAttachment).filter(NoteAttachment.stored_filename == safe_filename).first()
-    if not attachment:
-        raise HTTPException(404, "Attachment not found")
-    
-    # Verify access to engagement
-    if not session.has_engagement_access(attachment.engagement_id):
-        raise HTTPException(403, "Access denied")
-    
-    # Serve file
-    file_path = Path(ATTACHMENTS_PATH) / safe_filename
-    if not file_path.exists():
-        raise HTTPException(404, "File not found")
-    
-    return FileResponse(
-        file_path,
-        media_type=attachment.mime_type,
-        headers={
-            "Content-Disposition": f'inline; filename="{attachment.filename}"',
-            "Cache-Control": "private, max-age=86400",  # Cache for 1 day
-            "X-Content-Type-Options": "nosniff",
-        }
-    )
-
-
-# === Markdown Export ===
-
-def generate_yaml_frontmatter(page: NotePage, engagement: Engagement) -> str:
-    """Generate YAML frontmatter for exported markdown."""
-    frontmatter = [
-        "---",
-        f"title: \"{page.title.replace('\"', '\\\"')}\"",
-        f"note_id: \"{page.id}\"",
-        f"engagement_id: \"{engagement.id}\"",
-        f"created_at: \"{page.created_at.isoformat()}\"",
-        f"updated_at: \"{page.updated_at.isoformat()}\"",
-        "---",
-        ""
-    ]
-    return "\n".join(frontmatter)
-
-
-def generate_export_filename(title: str, note_id: str) -> str:
-    """
-    Generate a safe filename for export.
-    Format: {slugified-title}__note_{note_id_prefix}.md
-    """
-    slug = slugify(title)
-    return f"{slug}__note_{note_id[:8]}.md"
-
-
-def rewrite_attachment_paths(content: str, attachments: List[NoteAttachment]) -> str:
-    """
-    Rewrite attachment URLs in markdown content to use relative paths.
-    
-    Converts: ![alt](/api/attachments/filename.png)
-    To:       ![alt](./attachments/filename.png)
-    """
-    for att in attachments:
-        # Match both old and new URL formats
-        patterns = [
-            f"/api/attachments/{att.stored_filename}",
-            f"./attachments/{att.stored_filename}",
-        ]
-        replacement = f"./attachments/{att.stored_filename}"
-        for pattern in patterns:
-            content = content.replace(pattern, replacement)
-    return content
-
-
-@app.get("/api/engagements/{eid}/note-pages/{pid}/export")
-async def export_note_markdown(
-    eid: str, 
-    pid: str,
-    include_frontmatter: bool = True,
-    session: SessionData = Depends(get_current_session), 
-    db: Session = Depends(get_db)
-):
-    """
-    Export a single note page as Markdown (.md) file.
-    
-    Includes YAML frontmatter with metadata and rewrites attachment URLs
-    to use relative paths (./attachments/).
-    """
-    if Permission.EXPORT_DATA not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    
-    page = db.query(NotePage).filter(NotePage.id == pid, NotePage.engagement_id == eid).first()
-    if not page:
-        raise HTTPException(404, "Note page not found")
-    
-    engagement = db.query(Engagement).filter(Engagement.id == eid).first()
-    
-    # Get attachments for this page
-    attachments = db.query(NoteAttachment).filter(NoteAttachment.note_page_id == pid).all()
-    
-    # Build markdown content
-    parts = []
-    if include_frontmatter:
-        parts.append(generate_yaml_frontmatter(page, engagement))
-    
-    content = page.content or ""
-    content = rewrite_attachment_paths(content, attachments)
-    parts.append(content)
-    
-    markdown_content = "\n".join(parts)
-    
-    # Generate filename
-    filename = generate_export_filename(page.title, page.id)
-    
-    return StreamingResponse(
-        iter([markdown_content]),
-        media_type="text/markdown; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
-        }
-    )
-
-
-@app.get("/api/engagements/{eid}/notes/export")
-async def export_all_notes_zip(
-    eid: str,
-    include_frontmatter: bool = True,
-    include_attachments: bool = True,
-    session: SessionData = Depends(get_current_session), 
-    db: Session = Depends(get_db)
-):
-    """
-    Export all note pages as a ZIP archive containing:
-    - Individual .md files for each note
-    - attachments/ folder with all images
-    
-    Structure:
-    chronix_notes_YYYYMMDD_HHMMSS.zip
-    ├── note-title__note_abc123.md
-    ├── another-note__note_def456.md
-    └── attachments/
-        ├── abc12345_20240101_123456_a1b2c3d4.png
-        └── ...
-    """
-    if Permission.EXPORT_DATA not in ROLE_PERMISSIONS.get(session.role, set()):
-        raise HTTPException(403, "Denied")
-    verify_engagement_access(db, session, eid)
-    
-    engagement = db.query(Engagement).filter(Engagement.id == eid).first()
-    if not engagement:
-        raise HTTPException(404, "Engagement not found")
-    
-    pages = db.query(NotePage).filter(NotePage.engagement_id == eid).order_by(NotePage.order_index).all()
-    
-    # Create zip in memory
-    zip_buffer = io.BytesIO()
-    
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-        # Track which attachments to include
-        all_attachments = []
+        import uvicorn
+        from chronix.server import app
         
-        for page in pages:
-            # Get attachments for this page
-            attachments = db.query(NoteAttachment).filter(NoteAttachment.note_page_id == page.id).all()
-            all_attachments.extend(attachments)
-            
-            # Build markdown content
-            parts = []
-            if include_frontmatter:
-                parts.append(generate_yaml_frontmatter(page, engagement))
-            
-            content = page.content or ""
-            content = rewrite_attachment_paths(content, attachments)
-            parts.append(content)
-            
-            markdown_content = "\n".join(parts)
-            
-            # Generate filename and add to zip
-            filename = generate_export_filename(page.title, page.id)
-            zf.writestr(filename, markdown_content.encode('utf-8'))
+        # Log level: "warning" by default (suppresses connection spam)
+        # "debug" when --debug is set (shows all connection details)
+        log_level = "debug" if args.debug else "warning"
         
-        # Add attachments folder
-        if include_attachments and all_attachments:
-            attachments_dir = Path(ATTACHMENTS_PATH)
-            for att in all_attachments:
-                file_path = attachments_dir / att.stored_filename
-                if file_path.exists():
-                    # Add to attachments/ folder in zip
-                    arcname = f"attachments/{att.stored_filename}"
-                    zf.write(file_path, arcname)
+        uvicorn.run(
+            "chronix.server:app" if args.reload else app,
+            host=host,
+            port=args.port,
+            reload=args.reload,
+            log_level=log_level,
+        )
+    except KeyboardInterrupt:
+        print("\n\nShutting down Chronix...")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\nError starting server: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def print_banner(host: str, port: int, db_path: str, config_loaded: bool):
+    """Print the Chronix startup banner"""
+    ORANGE = "\033[38;5;208m"
+    GREEN = "\033[32m"
+    CYAN = "\033[36m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
     
-    # Prepare response
-    zip_buffer.seek(0)
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    zip_filename = f"chronix_notes_{slugify(engagement.name)}_{timestamp}.zip"
+    config_status = f"{GREEN}✓ Config loaded{RESET}" if config_loaded else f"{DIM}No config file{RESET}"
     
-    return StreamingResponse(
-        zip_buffer,
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{zip_filename}"',
-        }
+    print(f"""
+{ORANGE}╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║     ██████╗██╗  ██╗██████╗  ██████╗ ███╗   ██╗██╗██╗  ██╗    ║
+║    ██╔════╝██║  ██║██╔══██╗██╔═══██╗████╗  ██║██║╚██╗██╔╝    ║
+║    ██║     ███████║██████╔╝██║   ██║██╔██╗ ██║██║ ╚███╔╝     ║
+║    ██║     ██╔══██║██╔══██╗██║   ██║██║╚██╗██║██║ ██╔██╗     ║
+║    ╚██████╗██║  ██║██║  ██║╚██████╔╝██║ ╚████║██║██╔╝ ██╗    ║
+║     ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝╚═╝╚═╝  ╚═╝    ║
+║                                                               ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝{RESET}
+
+{GREEN}▶{RESET} Server:   {CYAN}http://{host}:{port}{RESET}
+{GREEN}▶{RESET} Database: {DIM}{db_path}{RESET}
+{GREEN}▶{RESET} Config:   {config_status}
+
+{DIM}Press Ctrl+C to stop{RESET}
+""")
+
+
+def print_network_warning(port: int):
+    """Print network accessibility warning when binding to 0.0.0.0"""
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+    
+    local_ips = get_local_ips()
+    
+    print(f"{YELLOW}⚠️  Chronix is accessible on your network at:{RESET}")
+    
+    # Always show localhost
+    print(f"    {CYAN}http://127.0.0.1:{port}{RESET}")
+    
+    # Show all detected network IPs
+    for ip in local_ips:
+        print(f"    {CYAN}http://{ip}:{port}{RESET}")
+    
+    print(f"\n    {DIM}Use --local flag to restrict to localhost only{RESET}")
+    print()
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="chronix",
+        description="Chronix",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-
-# === WebSocket ===
-
-@app.websocket("/ws/{eid}")
-async def ws_endpoint(ws: WebSocket, eid: str):
-    # Authenticate via session cookie (same as HTTP requests)
-    await ws.accept()
-    session_id = ws.cookies.get(SecurityConfig.SESSION_COOKIE_NAME)
-    if not session_id:
-        await ws.close(4001, "No session")
-        return
-    sess = session_store.get(session_id)
-    if not sess:
-        await ws.close(4001, "Invalid session")
-        return
-    if not sess.has_engagement_access(eid):
-        await ws.close(4003, "Access denied")
-        return
-    await manager.connect(ws, eid, sess.user_id, session_id)
-    db = SessionLocal()
-    try:
-        pres = db.query(OperatorPresence).filter(OperatorPresence.engagement_id == eid, OperatorPresence.operator_id == sess.user_id).first()
-        if pres:
-            pres.last_heartbeat = datetime.utcnow()
-        else:
-            db.add(OperatorPresence(engagement_id=eid, operator_id=sess.user_id, current_view="timeline"))
-        db.commit()
-    finally:
-        db.close()
-    try:
-        while True:
-            data = await ws.receive_json()
-            if not session_store.get(session_id):
-                await ws.close(4001, "Expired")
-                break
-            if data.get("type") == "heartbeat":
-                db = SessionLocal()
-                try:
-                    pres = db.query(OperatorPresence).filter(OperatorPresence.engagement_id == eid, OperatorPresence.operator_id == sess.user_id).first()
-                    if pres:
-                        pres.last_heartbeat = datetime.utcnow()
-                        pres.current_view = data.get("view", "timeline")
-                        db.commit()
-                finally:
-                    db.close()
-    except WebSocketDisconnect:
-        manager.disconnect(ws, eid)
-        db = SessionLocal()
-        try:
-            db.query(OperatorPresence).filter(OperatorPresence.engagement_id == eid, OperatorPresence.operator_id == sess.user_id).delete()
-            db.commit()
-        finally:
-            db.close()
-
-
-# === Health & Workspace ===
-
-@app.get("/api/health")
-def health():
-    return {"status": "healthy"}
-
-
-@app.get("/license")
-def license_info():
-    """Return licensing information for AGPLv3 compliance."""
-    return {
-        "name": "Chronix",
-        "license": "AGPL-3.0-only",
-        "license_url": "https://www.gnu.org/licenses/agpl-3.0.html",
-        "source_url": "https://github.com/icecubesandwich/chronix"
-    }
-
-
-@app.get("/api/workspace")
-def get_workspace(session: SessionData = Depends(get_current_session), db: Session = Depends(get_db)):
-    """
-    Get the default workspace.
-    Returns the single workspace for direct navigation after login.
-    """
-    workspace = db.query(Engagement).first()
-    if not workspace:
-        raise HTTPException(500, "Workspace not initialized")
     
-    entry_count = db.query(TimelineEntry).filter(
-        TimelineEntry.engagement_id == workspace.id,
-        TimelineEntry.is_deleted == False
-    ).count()
+    parser.add_argument(
+        "--version", "-v",
+        action="version",
+        version=f"chronix {get_version()}"
+    )
     
-    return {
-        "id": workspace.id,
-        "entry_count": entry_count,
-    }
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+    
+    # -------------------------------------------------------------------------
+    # init subcommand
+    # -------------------------------------------------------------------------
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Initialize Chronix",
+        description="Initialize Chronix.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    init_parser.add_argument(
+        "--db", "-d",
+        default=os.environ.get("CHRONIX_DB_PATH", "./chronix.db"),
+        help="Database path (default: ./chronix.db)"
+    )
+    init_parser.add_argument(
+        "--username", "-u",
+        default="admin",
+        help="Admin username (default: admin)"
+    )
+    init_parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Regenerate session secret"
+    )
+    
+    # -------------------------------------------------------------------------
+    # serve subcommand (also default when no command given)
+    # -------------------------------------------------------------------------
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Start server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_serve_arguments(serve_parser)
+    
+    # Also add serve arguments to main parser for default behavior
+    add_serve_arguments(parser)
+    
+    args = parser.parse_args()
+    
+    # Route to appropriate command
+    if args.command == "init":
+        sys.exit(cmd_init(args))
+    elif args.command == "serve":
+        cmd_serve(args)
+    else:
+        # Default: run server (no subcommand given)
+        # Need to load config first for default behavior
+        load_config()
+        cmd_serve(args)
 
 
-# === Frontend ===
-
-if FRONTEND_DIR.exists() and (FRONTEND_DIR / "index.html").exists():
-    if (FRONTEND_DIR / "assets").exists():
-        app.mount("/assets", StaticFiles(directory=FRONTEND_DIR / "assets"), name="assets")
-    
-    @app.get("/", response_class=HTMLResponse)
-    async def index():
-        return FileResponse(FRONTEND_DIR / "index.html")
-    
-    @app.get("/{path:path}")
-    async def spa(path: str):
-        f = FRONTEND_DIR / path
-        return FileResponse(f) if f.exists() and f.is_file() else FileResponse(FRONTEND_DIR / "index.html")
+def add_serve_arguments(parser):
+    """Add server-related arguments to a parser"""
+    parser.add_argument(
+        "--host", "-H",
+        default=os.environ.get("CHRONIX_HOST", "0.0.0.0"),
+        help="Bind address (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Bind to localhost only"
+    )
+    parser.add_argument(
+        "--port", "-p",
+        type=int,
+        default=int(os.environ.get("CHRONIX_PORT", "8000")),
+        help="Port (default: 8000)"
+    )
+    parser.add_argument(
+        "--db", "-d",
+        default=os.environ.get("CHRONIX_DB_PATH", "./chronix.db"),
+        help="Database path (default: ./chronix.db)"
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Skip browser launch"
+    )
+    parser.add_argument(
+        "--reload",
+        action="store_true",
+        help="Enable auto-reload"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode"
+    )
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
