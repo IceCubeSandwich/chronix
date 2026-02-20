@@ -72,6 +72,9 @@ class SecurityConfig:
     # TLS/Proxy settings
     BEHIND_PROXY: bool = os.environ.get("CHRONIX_BEHIND_PROXY", "false").lower() == "true"
     
+    # CHRONIX-006 FIX: Separate cookie secure flag — defaults True for safety
+    COOKIE_SECURE: bool = os.environ.get("CHRONIX_COOKIE_SECURE", "true").lower() != "false"
+    
     @classmethod
     def load(cls):
         """Load and validate configuration from environment variables.
@@ -91,6 +94,8 @@ class SecurityConfig:
         cls.RATE_LIMIT_WRITE_WINDOW = int(os.environ.get("CHRONIX_RATE_LIMIT_WRITE_WINDOW", "60"))
         cls.DEBUG_MODE = os.environ.get("CHRONIX_DEBUG", "false").lower() == "true"
         cls.BEHIND_PROXY = os.environ.get("CHRONIX_BEHIND_PROXY", "false").lower() == "true"
+        # CHRONIX-006 FIX: Load cookie secure flag
+        cls.COOKIE_SECURE = os.environ.get("CHRONIX_COOKIE_SECURE", "true").lower() != "false"
         
         # Parse CORS origins
         cors_env = os.environ.get("CHRONIX_CORS_ORIGINS", "")
@@ -458,9 +463,23 @@ def sanitize_markdown(content: str) -> str:
     """
     Sanitize markdown/HTML content to prevent XSS.
     Strips dangerous tags and attributes.
+    Also rejects dangerous URL schemes in markdown link syntax.
     """
     if not content:
         return content
+    
+    # CHRONIX-005 FIX: Strip dangerous URL schemes from markdown links before bleach
+    # bleach only sanitizes HTML tags — markdown link syntax bypasses it entirely
+    _DANGEROUS_SCHEMES = re.compile(
+        r'\[([^\]]+)\]\((javascript:|data:|vbscript:)', re.IGNORECASE
+    )
+    content = _DANGEROUS_SCHEMES.sub(r'[\1](', content)
+    
+    # Also strip dangerous schemes in bare HTML href attributes
+    _DANGEROUS_HREF = re.compile(
+        r'href\s*=\s*["\']?(javascript:|data:|vbscript:)', re.IGNORECASE
+    )
+    content = _DANGEROUS_HREF.sub('href="', content)
     
     # Use bleach to clean HTML
     cleaned = bleach.clean(
@@ -599,11 +618,14 @@ session_cookie = APIKeyCookie(name=SecurityConfig.SESSION_COOKIE_NAME, auto_erro
 def get_client_ip(request: Request) -> str:
     """Get client IP, handling proxies"""
     if SecurityConfig.BEHIND_PROXY:
-        # Trust X-Forwarded-For header when behind proxy
+        # CHRONIX-007 FIX: Trust the LAST (rightmost) IP in X-Forwarded-For,
+        # which is the one appended by our trusted reverse proxy.
+        # The first IP is attacker-controlled and must not be trusted.
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
-            # Take the first IP (client IP)
-            return forwarded.split(",")[0].strip()
+            ips = [ip.strip() for ip in forwarded.split(",") if ip.strip()]
+            if ips:
+                return ips[-1]
     return request.client.host if request.client else "unknown"
 
 
@@ -732,8 +754,9 @@ def set_session_cookie(response: Response, session_id: str):
         key=SecurityConfig.SESSION_COOKIE_NAME,
         value=session_id,
         httponly=True,
-        secure=SecurityConfig.BEHIND_PROXY,  # Secure only when behind TLS-terminating proxy
-        samesite="lax",
+        # CHRONIX-006 FIX: Use dedicated COOKIE_SECURE flag (defaults True)
+        secure=SecurityConfig.COOKIE_SECURE,
+        samesite="strict",  # Upgraded from "lax" for additional CSRF resistance
         max_age=SecurityConfig.SESSION_EXPIRE_HOURS * 3600,
         path="/",
     )
@@ -759,6 +782,15 @@ def get_security_headers() -> Dict[str, str]:
         "X-XSS-Protection": "1; mode=block",
         "Referrer-Policy": "strict-origin-when-cross-origin",
     }
+    
+    # CHRONIX-011 FIX: Add HSTS when TLS is in use
+    if SecurityConfig.BEHIND_PROXY or SecurityConfig.COOKIE_SECURE:
+        headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    
+    # CHRONIX-011 FIX: Add Permissions-Policy to restrict browser features
+    headers["Permissions-Policy"] = (
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+    )
     
     # Add stricter CSP in production
     if not SecurityConfig.DEBUG_MODE:

@@ -322,9 +322,16 @@ class NotePageListResponse(BaseModel):
     total: int
 
 
+# CHRONIX-009 FIX: Typed Pydantic model for page order items
+class PageOrderItem(BaseModel):
+    """Individual page order entry with validated fields"""
+    id: str = Field(..., min_length=1, max_length=64)
+    order_index: int = Field(..., ge=0, le=10000)
+
+
 class NotePageReorderRequest(BaseModel):
     """Request to reorder note pages"""
-    page_orders: List[dict]  # [{"id": "page-id", "order_index": 0}, ...]
+    page_orders: List[PageOrderItem] = Field(..., max_length=100)
 
 
 # === CSV Import/Export ===
@@ -372,7 +379,7 @@ class NoteAttachmentResponse(BaseModel):
     note_page_id: str
     engagement_id: str
     filename: str
-    stored_filename: str
+    # CHRONIX-010 FIX: stored_filename removed — internal implementation detail
     mime_type: str
     file_size: int
     alt_text: Optional[str] = ""

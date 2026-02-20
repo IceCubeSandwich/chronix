@@ -66,6 +66,9 @@ from .core.security.filesystem import (
 DATABASE_PATH = os.environ.get("CHRONIX_DB_PATH", "chronix.db")
 ATTACHMENTS_PATH = os.environ.get("CHRONIX_ATTACHMENTS_PATH", "attachments")
 MAX_ATTACHMENT_SIZE = int(os.environ.get("CHRONIX_MAX_ATTACHMENT_SIZE", str(10 * 1024 * 1024)))  # 10MB default
+# CHRONIX-003 FIX: CSV import size and row limits
+MAX_CSV_IMPORT_SIZE = int(os.environ.get("CHRONIX_MAX_CSV_SIZE", str(5 * 1024 * 1024)))  # 5MB default
+MAX_CSV_ROWS = int(os.environ.get("CHRONIX_MAX_CSV_ROWS", "10000"))
 ALLOWED_MIME_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 
 engine = None
@@ -174,6 +177,28 @@ async def security_headers(request: Request, call_next):
     for k, v in get_security_headers().items():
         response.headers[k] = v
     return response
+
+
+@app.middleware("http")
+async def csrf_middleware(request: Request, call_next):
+    """
+    CHRONIX-001 FIX: Global CSRF enforcement for all state-changing requests.
+    Validates X-CSRF-Token header against the session-bound CSRF token.
+    """
+    SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+    # Login needs to work without a session; logout is safe to exempt
+    EXEMPT_PATHS = {"/api/auth/login", "/api/auth/logout"}
+    
+    if request.method not in SAFE_METHODS and request.url.path not in EXEMPT_PATHS:
+        # Only enforce on /api/ paths (not static files or SPA routes)
+        if request.url.path.startswith("/api/"):
+            from .security import verify_csrf_token
+            sid = request.cookies.get(SecurityConfig.SESSION_COOKIE_NAME)
+            token = request.headers.get("X-CSRF-Token", "")
+            if not sid or not token or not verify_csrf_token(sid, token):
+                return Response("CSRF token required", status_code=403)
+    
+    return await call_next(request)
 
 
 FRONTEND_DIR = Path(__file__).parent / "frontend_dist"
@@ -572,12 +597,10 @@ async def reorder_pages(eid: str, data: NotePageReorderRequest, session: Session
     verify_engagement_access(db, session, eid)
     
     for item in data.page_orders:
-        page_id = item.get("id")
-        order_index = item.get("order_index")
-        if page_id is not None and order_index is not None:
-            p = db.query(NotePage).filter(NotePage.id == page_id, NotePage.engagement_id == eid).first()
-            if p:
-                p.order_index = order_index
+        # CHRONIX-009 FIX: item is now a typed PageOrderItem, not raw dict
+        p = db.query(NotePage).filter(NotePage.id == item.id, NotePage.engagement_id == eid).first()
+        if p:
+            p.order_index = item.order_index
     db.commit()
     await manager.broadcast(eid, {"type": "notepage_update", "action": "reorder"})
     return {"message": "Reordered"}
@@ -627,7 +650,9 @@ async def export(eid: str, include_deleted: bool = False, session: SessionData =
             "system_modification": sanitize_csv_field(e.system_modification.value if e.system_modification else ""), "comments": sanitize_csv_field(e.comments or ""),
         })
     eng = db.query(Engagement).filter(Engagement.id == eid).first()
-    fn = f"chronix_{eng.name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    # CHRONIX-002 FIX: Sanitize engagement name to prevent header injection
+    safe_name = sanitize_content_disposition(eng.name)
+    fn = f"chronix_{safe_name}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
     return StreamingResponse(iter([out.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
 
@@ -658,7 +683,11 @@ async def import_csv(eid: str, file: UploadFile = File(...), session: SessionDat
     
     # Read and decode file
     try:
-        content = await file.read()
+        # CHRONIX-003 FIX: Enforce file size limit before reading entire file
+        content = await file.read(MAX_CSV_IMPORT_SIZE + 1)
+        if len(content) > MAX_CSV_IMPORT_SIZE:
+            return CSVImportResult(success=False, imported_count=0, error_count=1,
+                                  errors=[f"CSV file too large (max {MAX_CSV_IMPORT_SIZE} bytes)"])
         text = content.decode('utf-8')
     except UnicodeDecodeError:
         return CSVImportResult(success=False, imported_count=0, error_count=1, errors=["File must be UTF-8 encoded"])
@@ -669,6 +698,10 @@ async def import_csv(eid: str, file: UploadFile = File(...), session: SessionDat
     errors = []
     
     for row_num, row in enumerate(reader, start=2):  # Row 2 is first data row after header
+        # CHRONIX-003 FIX: Enforce row count limit
+        if row_num - 1 > MAX_CSV_ROWS:
+            errors.append(f"Row limit ({MAX_CSV_ROWS}) exceeded, import truncated")
+            break
         try:
             # Parse start_time (required for a valid entry)
             start_time = parse_datetime_for_import(row.get("start_time", ""))
@@ -705,6 +738,9 @@ async def import_csv(eid: str, file: UploadFile = File(...), session: SessionDat
             )
             db.add(entry)
             imported_count += 1
+            # CHRONIX-003 FIX: Batch commits to avoid long DB locks
+            if imported_count % 500 == 0:
+                db.commit()
         except Exception as e:
             error_count += 1
             errors.append(f"Row {row_num}: {str(e)}")
@@ -785,7 +821,7 @@ def attachment_to_response(att: NoteAttachment) -> NoteAttachmentResponse:
         note_page_id=att.note_page_id,
         engagement_id=att.engagement_id,
         filename=att.filename,
-        stored_filename=att.stored_filename,
+        # CHRONIX-010 FIX: stored_filename removed from response
         mime_type=att.mime_type,
         file_size=att.file_size,
         alt_text=att.alt_text or "",
@@ -1096,7 +1132,7 @@ def generate_yaml_frontmatter(page: NotePage, engagement: Engagement) -> str:
     """Generate YAML frontmatter for exported markdown."""
     frontmatter = [
         "---",
-        f"title: \"{page.title.replace('\"', '\\\"')}\"",
+        "title: \"{}\"".format(page.title.replace('"', '\\"')),
         f"note_id: \"{page.id}\"",
         f"engagement_id: \"{engagement.id}\"",
         f"created_at: \"{page.created_at.isoformat()}\"",
@@ -1263,7 +1299,9 @@ async def export_all_notes_zip(
     # Prepare response
     zip_buffer.seek(0)
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    zip_filename = f"chronix_notes_{slugify(engagement.name)}_{timestamp}.zip"
+    # CHRONIX-002 FIX: Use sanitize_content_disposition for header safety
+    safe_name = sanitize_content_disposition(engagement.name)
+    zip_filename = f"chronix_notes_{safe_name}_{timestamp}.zip"
     
     return StreamingResponse(
         zip_buffer,
@@ -1278,8 +1316,8 @@ async def export_all_notes_zip(
 
 @app.websocket("/ws/{eid}")
 async def ws_endpoint(ws: WebSocket, eid: str):
-    # Authenticate via session cookie (same as HTTP requests)
-    await ws.accept()
+    # CHRONIX-012 FIX: Validate session cookie BEFORE accepting the WebSocket
+    # This prevents resource exhaustion from unauthenticated connection floods
     session_id = ws.cookies.get(SecurityConfig.SESSION_COOKIE_NAME)
     if not session_id:
         await ws.close(4001, "No session")
@@ -1291,6 +1329,9 @@ async def ws_endpoint(ws: WebSocket, eid: str):
     if not sess.has_engagement_access(eid):
         await ws.close(4003, "Access denied")
         return
+    
+    # Only accept after authentication passes
+    await ws.accept()
     await manager.connect(ws, eid, sess.user_id, session_id)
     db = SessionLocal()
     try:
@@ -1304,7 +1345,15 @@ async def ws_endpoint(ws: WebSocket, eid: str):
         db.close()
     try:
         while True:
-            data = await ws.receive_json()
+            # CHRONIX-008 FIX: Handle malformed JSON gracefully
+            try:
+                data = await ws.receive_json()
+            except (ValueError, KeyError):
+                # Malformed JSON — ignore frame, keep connection open
+                continue
+            except Exception:
+                # Unexpected parse error — close cleanly
+                break
             if not session_store.get(session_id):
                 await ws.close(4001, "Expired")
                 break
@@ -1314,11 +1363,19 @@ async def ws_endpoint(ws: WebSocket, eid: str):
                     pres = db.query(OperatorPresence).filter(OperatorPresence.engagement_id == eid, OperatorPresence.operator_id == sess.user_id).first()
                     if pres:
                         pres.last_heartbeat = datetime.utcnow()
-                        pres.current_view = data.get("view", "timeline")
+                        # CHRONIX-004 FIX: Allowlist the view field
+                        VALID_VIEWS = {"timeline", "notes", "export"}
+                        view_val = data.get("view", "timeline")
+                        if not isinstance(view_val, str) or view_val not in VALID_VIEWS:
+                            view_val = "timeline"
+                        pres.current_view = view_val
                         db.commit()
                 finally:
                     db.close()
     except WebSocketDisconnect:
+        pass
+    finally:
+        # CHRONIX-008 FIX: Always clean up presence in finally block
         manager.disconnect(ws, eid)
         db = SessionLocal()
         try:
